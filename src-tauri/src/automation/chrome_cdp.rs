@@ -380,21 +380,70 @@ impl ChromeConnection {
             }
             "double_click" => {
                 if let Some(s) = target.as_str() {
-                    let id = self.find_element(s).await?;
-                    let b = self.get_bounds(id).await?;
-                    self.double_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    if s.starts_with("ax:") {
+                        // Click accessibility node
+                        let tree = self.send("Accessibility.getFullAXTree", json!({})).await?;
+                        let nodes = tree["nodes"].as_array().ok_or("No nodes")?;
+                        let node = nodes.iter().find(|n| n["nodeId"].as_str() == Some(&s[3..])).ok_or("AX not found")?;
+                        let backend = node["backendDOMNodeId"].as_i64().ok_or("No backend")?;
+                        let r = self.send("DOM.getBoxModel", json!({"backendNodeId": backend})).await?;
+                        let c = r["model"]["content"].as_array().ok_or("No box")?;
+                        let cx = (c[0].as_f64().unwrap_or(0.0) + c[4].as_f64().unwrap_or(0.0)) / 2.0;
+                        let cy = (c[1].as_f64().unwrap_or(0.0) + c[5].as_f64().unwrap_or(0.0)) / 2.0;
+                        self.double_click_at(cx, cy).await?;
+                    } else if s.starts_with("xpath:") {
+                        let node_id = self.find_by_xpath(&s[6..]).await?;
+                        let b = self.get_bounds(node_id).await?;
+                        self.double_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    } else {
+                        let id = self.find_element(s).await?;
+                        let b = self.get_bounds(id).await?;
+                        self.double_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    }
                 }
             }
             "right_click" => {
                 if let Some(s) = target.as_str() {
-                    let id = self.find_element(s).await?;
-                    let b = self.get_bounds(id).await?;
-                    self.right_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    if s.starts_with("ax:") {
+                        let tree = self.send("Accessibility.getFullAXTree", json!({})).await?;
+                        let nodes = tree["nodes"].as_array().ok_or("No nodes")?;
+                        let node = nodes.iter().find(|n| n["nodeId"].as_str() == Some(&s[3..])).ok_or("AX not found")?;
+                        let backend = node["backendDOMNodeId"].as_i64().ok_or("No backend")?;
+                        let r = self.send("DOM.getBoxModel", json!({"backendNodeId": backend})).await?;
+                        let c = r["model"]["content"].as_array().ok_or("No box")?;
+                        let cx = (c[0].as_f64().unwrap_or(0.0) + c[4].as_f64().unwrap_or(0.0)) / 2.0;
+                        let cy = (c[1].as_f64().unwrap_or(0.0) + c[5].as_f64().unwrap_or(0.0)) / 2.0;
+                        self.right_click_at(cx, cy).await?;
+                    } else if s.starts_with("xpath:") {
+                        let node_id = self.find_by_xpath(&s[6..]).await?;
+                        let b = self.get_bounds(node_id).await?;
+                        self.right_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    } else {
+                        let id = self.find_element(s).await?;
+                        let b = self.get_bounds(id).await?;
+                        self.right_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    }
                 }
             }
             "hover" => {
                 if let Some(s) = target.as_str() {
-                    self.hover_element(s).await?;
+                    if s.starts_with("ax:") {
+                        let tree = self.send("Accessibility.getFullAXTree", json!({})).await?;
+                        let nodes = tree["nodes"].as_array().ok_or("No nodes")?;
+                        let node = nodes.iter().find(|n| n["nodeId"].as_str() == Some(&s[3..])).ok_or("AX not found")?;
+                        let backend = node["backendDOMNodeId"].as_i64().ok_or("No backend")?;
+                        let r = self.send("DOM.getBoxModel", json!({"backendNodeId": backend})).await?;
+                        let c = r["model"]["content"].as_array().ok_or("No box")?;
+                        let cx = (c[0].as_f64().unwrap_or(0.0) + c[4].as_f64().unwrap_or(0.0)) / 2.0;
+                        let cy = (c[1].as_f64().unwrap_or(0.0) + c[5].as_f64().unwrap_or(0.0)) / 2.0;
+                        self.hover_at(cx, cy).await?;
+                    } else if s.starts_with("xpath:") {
+                        let node_id = self.find_by_xpath(&s[6..]).await?;
+                        let b = self.get_bounds(node_id).await?;
+                        self.hover_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                    } else {
+                        self.hover_element(s).await?;
+                    }
                 }
             }
             "type" => {

@@ -66,14 +66,14 @@ async fn load_api_key(state: State<'_, AppState>) -> Result<Option<String>, Stri
 
 #[tauri::command]
 async fn get_current_state() -> Result<ExecutionState, String> {
-    get_browser_state().await
+    get_current_state_auto().await
 }
 
 #[tauri::command]
 async fn execute_user_command(command: String, state: State<'_, AppState>) -> Result<ActionCommand, String> {
     *state.current_goal.lock().unwrap() = Some(command.clone());
-    
-    let cs = get_browser_state().await?;
+
+    let cs = get_current_state_auto().await?;
     
     // Get history without holding the lock across await
     let recent: Vec<HistoryEntry> = {
@@ -103,42 +103,46 @@ async fn approve_action(approved: bool, state: State<'_, AppState>) -> Result<Ex
     let api_key = state.api_key.lock().unwrap().clone().ok_or("No API key")?;
     
     let mut attempts = 0;
+    let mut chunk_index = 0;
+    let max_attempts = 5;
     let mut current_action = action.clone();
-    
+
     loop {
         attempts += 1;
-        match execute_browser_action(&current_action).await {
+        match execute_action_auto(&current_action).await {
             Ok(new_state) => {
-                let entry = HistoryEntry { 
-                    timestamp: chrono::Utc::now().to_rfc3339(), 
-                    user_input: goal.clone(), 
-                    llm_reasoning: current_action.reasoning.clone().unwrap_or_default(), 
-                    action: current_action.clone(), 
-                    success: true, 
-                    error: None 
+                let entry = HistoryEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    user_input: goal.clone(),
+                    llm_reasoning: current_action.reasoning.clone().unwrap_or_default(),
+                    action: current_action.clone(),
+                    success: true,
+                    error: None
                 };
                 state.history.lock().unwrap().push(entry);
                 *state.pending_action.lock().unwrap() = None;
                 return Ok(new_state);
             }
-            Err(e) if attempts < 3 => {
-                let failure_state = get_browser_state().await?;
+            Err(e) if attempts < max_attempts => {
+                // Increment chunk_index to send next portion of a11y tree
+                chunk_index += 1;
+                let failure_state = get_current_state_auto().await?;
                 let recent: Vec<HistoryEntry> = {
                     let h = state.history.lock().unwrap();
                     h.iter().rev().take(10).cloned().collect()
                 };
-                current_action = ai::claude::get_retry_action(&api_key, &current_action, &e, &failure_state, &recent)
+                current_action = ai::claude::get_retry_action(&api_key, &current_action, &e, &failure_state, &recent, chunk_index)
                     .await
                     .map_err(|e| e.to_string())?;
             }
             Err(e) => {
-                let entry = HistoryEntry { 
-                    timestamp: chrono::Utc::now().to_rfc3339(), 
-                    user_input: goal.clone(), 
-                    llm_reasoning: format!("Failed after {} attempts", attempts), 
-                    action: current_action.clone(), 
-                    success: false, 
-                    error: Some(e.clone()) 
+                let entry = HistoryEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    user_input: goal.clone(),
+                    llm_reasoning: format!("Failed after {} attempts", attempts),
+                    action: current_action.clone(),
+                    success: false,
+                    error: Some(e.clone())
                 };
                 state.history.lock().unwrap().push(entry);
                 *state.pending_action.lock().unwrap() = None;
@@ -230,15 +234,31 @@ $tree | ConvertTo-Json -Depth 20 -Compress
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Automation mode - browser (Chrome CDP) or desktop (Windows UI Automation)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AutomationMode {
+    Browser,
+    Desktop,
+}
+
+/// Detect which automation mode to use based on whether Chrome is available
+async fn detect_automation_mode() -> AutomationMode {
+    // Try to connect to Chrome debugging port
+    match automation::chrome_cdp::ChromeConnection::connect_to_first_tab(9222).await {
+        Ok(_) => AutomationMode::Browser,
+        Err(_) => AutomationMode::Desktop,
+    }
+}
+
 async fn get_browser_state() -> Result<ExecutionState, String> {
     let conn = automation::chrome_cdp::ChromeConnection::connect_to_first_tab(9222)
         .await
         .map_err(|e| format!("Chrome connection failed: {}. Make sure Chrome is running with --remote-debugging-port=9222", e))?;
-    
+
     let browser_state = conn.get_browser_state()
         .await
         .map_err(|e| e.to_string())?;
-    
+
     Ok(ExecutionState {
         screenshot_base64: browser_state.screenshot_base64,
         accessibility_tree: serde_json::to_value(&browser_state.accessibility_tree).unwrap_or_default(),
@@ -249,17 +269,71 @@ async fn get_browser_state() -> Result<ExecutionState, String> {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn get_desktop_state_sync() -> Result<ExecutionState, String> {
+    let wa = automation::windows_ui::WindowsAutomation::new()
+        .map_err(|e| e.to_string())?;
+
+    let desktop_state = wa.get_desktop_state()
+        .map_err(|e| e.to_string())?;
+
+    Ok(ExecutionState {
+        screenshot_base64: desktop_state.screenshot_base64,
+        accessibility_tree: serde_json::to_value(&desktop_state.accessibility_tree).unwrap_or_default(),
+        active_window: desktop_state.window_title,
+        url: None,
+        success: true,
+        error: None,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_desktop_state_sync() -> Result<ExecutionState, String> {
+    Err("Desktop automation is only available on Windows".to_string())
+}
+
+async fn get_current_state_auto() -> Result<ExecutionState, String> {
+    match detect_automation_mode().await {
+        AutomationMode::Browser => get_browser_state().await,
+        AutomationMode::Desktop => get_desktop_state_sync(),
+    }
+}
+
 async fn execute_browser_action(action: &ActionCommand) -> Result<ExecutionState, String> {
     let conn = automation::chrome_cdp::ChromeConnection::connect_to_first_tab(9222)
         .await
         .map_err(|e| e.to_string())?;
-    
+
     conn.execute_llm_action(&action.action_type, &action.target, action.params.as_ref())
         .await
         .map_err(|e| e.to_string())?;
-    
+
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     get_browser_state().await
+}
+
+#[cfg(target_os = "windows")]
+fn execute_desktop_action_sync(action: &ActionCommand) -> Result<ExecutionState, String> {
+    let wa = automation::windows_ui::WindowsAutomation::new()
+        .map_err(|e| e.to_string())?;
+
+    wa.execute_llm_action(&action.action_type, &action.target, action.params.as_ref())
+        .map_err(|e| e.to_string())?;
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    get_desktop_state_sync()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn execute_desktop_action_sync(_action: &ActionCommand) -> Result<ExecutionState, String> {
+    Err("Desktop automation is only available on Windows".to_string())
+}
+
+async fn execute_action_auto(action: &ActionCommand) -> Result<ExecutionState, String> {
+    match detect_automation_mode().await {
+        AutomationMode::Browser => execute_browser_action(action).await,
+        AutomationMode::Desktop => execute_desktop_action_sync(action),
+    }
 }
 
 fn main() {
