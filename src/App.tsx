@@ -14,6 +14,31 @@ export default function App() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [autoApprove, setAutoApprove] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [toast, setToast] = useState<{message: string; type: "success"|"error"} | null>(null);
+
+  const showToast = (message: string, type: "success"|"error") => {
+    setToast({message, type});
+    setTimeout(() => setToast(null), 2000);
+  };
+
+  const handleScreenshot = async () => {
+    try {
+      await invoke("take_screenshot_to_clipboard");
+      showToast("Screenshot copied!", "success");
+    } catch (e: any) {
+      showToast(`Error: ${e}`, "error");
+    }
+  };
+
+  const handleA11yTree = async () => {
+    try {
+      const json: string = await invoke("get_screen_a11y_tree");
+      await navigator.clipboard.writeText(json);
+      showToast("A11y tree copied!", "success");
+    } catch (e: any) {
+      showToast(`Error: ${e}`, "error");
+    }
+  };
 
   useEffect(() => { loadApiKey(); }, []);
 
@@ -94,6 +119,8 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={autoApprove} onChange={e => setAutoApprove(e.target.checked)} />Auto-approve</label>
+            <button onClick={handleScreenshot} className="px-3 py-1 bg-gray-700 rounded text-sm">Screenshot</button>
+            <button onClick={handleA11yTree} className="px-3 py-1 bg-gray-700 rounded text-sm">A11y Tree</button>
             <button onClick={() => setShowHistory(!showHistory)} className="px-3 py-1 bg-gray-700 rounded text-sm">{showHistory ? "Hide" : "Show"} History</button>
           </div>
         </div>
@@ -129,6 +156,11 @@ export default function App() {
           </form>
         </div>
       </div>
+      {toast && (
+        <div className={`fixed bottom-4 right-4 px-4 py-2 rounded-lg text-sm ${toast.type === "success" ? "bg-green-600" : "bg-red-600"}`}>
+          {toast.message}
+        </div>
+      )}
     </div>
   );
 }

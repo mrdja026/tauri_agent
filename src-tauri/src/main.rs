@@ -154,9 +154,80 @@ async fn get_history(state: State<'_, AppState>) -> Result<Vec<HistoryEntry>, St
 }
 
 #[tauri::command]
-async fn clear_history(state: State<'_, AppState>) -> Result<(), String> { 
-    state.history.lock().unwrap().clear(); 
-    Ok(()) 
+async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+    state.history.lock().unwrap().clear();
+    Ok(())
+}
+
+#[tauri::command]
+async fn take_screenshot_to_clipboard() -> Result<(), String> {
+    use arboard::{Clipboard, ImageData};
+    use xcap::Monitor;
+
+    let monitors = Monitor::all().map_err(|e| e.to_string())?;
+    let monitor = monitors.first().ok_or("No monitor found")?;
+    let img = monitor.capture_image().map_err(|e| e.to_string())?;
+
+    let width = img.width() as usize;
+    let height = img.height() as usize;
+    let raw = img.into_raw();
+
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_image(ImageData {
+        width,
+        height,
+        bytes: std::borrow::Cow::Owned(raw),
+    }).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_screen_a11y_tree() -> Result<String, String> {
+    let ps_script = r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+$auto = [System.Windows.Automation.AutomationElement]::RootElement
+$walker = [System.Windows.Automation.TreeWalker]::ContentViewWalker
+
+function Get-Tree {
+    param($el, $depth)
+    if ($depth -gt 4 -or $null -eq $el) { return $null }
+
+    $current = $el.Current
+    $children = @()
+
+    $child = $walker.GetFirstChild($el)
+    while ($null -ne $child) {
+        $c = Get-Tree -el $child -depth ($depth + 1)
+        if ($c) { $children += $c }
+        $child = $walker.GetNextSibling($child)
+    }
+
+    @{
+        name = $current.Name
+        type = $current.ControlType.ProgrammaticName
+        className = $current.ClassName
+        automationId = $current.AutomationId
+        children = $children
+    }
+}
+
+$tree = Get-Tree -el $auto -depth 0
+$tree | ConvertTo-Json -Depth 20 -Compress
+"#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-ExecutionPolicy", "Bypass", "-Command", ps_script])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 async fn get_browser_state() -> Result<ExecutionState, String> {
@@ -209,13 +280,15 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            save_api_key, 
-            load_api_key, 
-            get_current_state, 
-            execute_user_command, 
-            approve_action, 
-            get_history, 
-            clear_history
+            save_api_key,
+            load_api_key,
+            get_current_state,
+            execute_user_command,
+            approve_action,
+            get_history,
+            clear_history,
+            take_screenshot_to_clipboard,
+            get_screen_a11y_tree
         ])
         .run(tauri::generate_context!())
         .expect("error running app");

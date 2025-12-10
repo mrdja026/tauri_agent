@@ -197,6 +197,170 @@ impl ChromeConnection {
         Ok(r["data"].as_str().unwrap_or("").to_string())
     }
 
+    // Bring page/tab to front (activate tab)
+    pub async fn focus_window(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Page.bringToFront", json!({})).await?;
+        Ok(())
+    }
+
+    // Find element by XPath and return node ID
+    pub async fn find_by_xpath(&self, xpath: &str) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.send("DOM.enable", json!({})).await?;
+        let _ = self.send("DOM.getDocument", json!({})).await?;
+
+        // Use DOM.performSearch for XPath
+        let search = self.send("DOM.performSearch", json!({"query": xpath})).await?;
+        let search_id = search["searchId"].as_str().ok_or("No searchId")?;
+        let count = search["resultCount"].as_i64().unwrap_or(0);
+
+        if count == 0 {
+            self.send("DOM.discardSearchResults", json!({"searchId": search_id})).await?;
+            return Err("XPath not found".into());
+        }
+
+        let results = self.send("DOM.getSearchResults", json!({
+            "searchId": search_id,
+            "fromIndex": 0,
+            "toIndex": 1
+        })).await?;
+
+        self.send("DOM.discardSearchResults", json!({"searchId": search_id})).await?;
+
+        results["nodeIds"][0].as_i64().ok_or("No node found".into())
+    }
+
+    // Click element by XPath
+    pub async fn click_xpath(&self, xpath: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let node_id = self.find_by_xpath(xpath).await?;
+        let b = self.get_bounds(node_id).await?;
+        self.click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await
+    }
+
+    // Hover over element (move mouse without clicking)
+    pub async fn hover_at(&self, x: f64, y: f64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x, "y": y})).await?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    pub async fn hover_element(&self, selector: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let id = self.find_element(selector).await?;
+        let b = self.get_bounds(id).await?;
+        self.hover_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await
+    }
+
+    // Get text content of element
+    pub async fn get_text(&self, selector: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let js = format!(r#"document.querySelector('{}')?.innerText || ''"#, selector.replace('\'', "\\'"));
+        let r = self.send("Runtime.evaluate", json!({"expression": js})).await?;
+        Ok(r["result"]["value"].as_str().unwrap_or("").to_string())
+    }
+
+    // Get attribute value
+    pub async fn get_attribute(&self, selector: &str, attr: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let js = format!(r#"document.querySelector('{}')?.getAttribute('{}') || ''"#,
+            selector.replace('\'', "\\'"), attr.replace('\'', "\\'"));
+        let r = self.send("Runtime.evaluate", json!({"expression": js})).await?;
+        Ok(r["result"]["value"].as_str().unwrap_or("").to_string())
+    }
+
+    // Select option from dropdown
+    pub async fn select_option(&self, selector: &str, value: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let js = format!(r#"
+            (function() {{
+                const el = document.querySelector('{}');
+                if (!el) return false;
+                el.value = '{}';
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }})()
+        "#, selector.replace('\'', "\\'"), value.replace('\'', "\\'"));
+        self.send("Runtime.evaluate", json!({"expression": js})).await?;
+        Ok(())
+    }
+
+    // Wait for element to appear (polling)
+    pub async fn wait_for_element(&self, selector: &str, timeout_ms: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        while start.elapsed() < timeout {
+            let js = format!(r#"!!document.querySelector('{}')"#, selector.replace('\'', "\\'"));
+            let r = self.send("Runtime.evaluate", json!({"expression": js})).await?;
+            if r["result"]["value"].as_bool().unwrap_or(false) {
+                return Ok(());
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        Err(format!("Timeout waiting for {}", selector).into())
+    }
+
+    // Execute arbitrary JavaScript
+    pub async fn eval_js(&self, js: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let r = self.send("Runtime.evaluate", json!({"expression": js, "returnByValue": true})).await?;
+        Ok(r["result"]["value"].clone())
+    }
+
+    // Double click
+    pub async fn double_click_at(&self, x: f64, y: f64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        self.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        Ok(())
+    }
+
+    // Right click
+    pub async fn right_click_at(&self, x: f64, y: f64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": x, "y": y, "button": "right", "clickCount": 1})).await?;
+        self.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": x, "y": y, "button": "right", "clickCount": 1})).await?;
+        Ok(())
+    }
+
+    // Clear input field
+    pub async fn clear_input(&self, selector: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.click_element(selector).await?;
+        // Select all and delete
+        self.send("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "a", "modifiers": 2})).await?; // Ctrl+A
+        self.send("Input.dispatchKeyEvent", json!({"type": "keyUp", "key": "a", "modifiers": 2})).await?;
+        self.send("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "Backspace"})).await?;
+        self.send("Input.dispatchKeyEvent", json!({"type": "keyUp", "key": "Backspace"})).await?;
+        Ok(())
+    }
+
+    // Go back in history
+    pub async fn go_back(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Page.enable", json!({})).await?;
+        let history = self.send("Page.getNavigationHistory", json!({})).await?;
+        let current = history["currentIndex"].as_i64().unwrap_or(0);
+        if current > 0 {
+            let entries = history["entries"].as_array().ok_or("No entries")?;
+            let entry_id = entries[(current - 1) as usize]["id"].as_i64().ok_or("No id")?;
+            self.send("Page.navigateToHistoryEntry", json!({"entryId": entry_id})).await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        Ok(())
+    }
+
+    // Go forward in history
+    pub async fn go_forward(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Page.enable", json!({})).await?;
+        let history = self.send("Page.getNavigationHistory", json!({})).await?;
+        let current = history["currentIndex"].as_i64().unwrap_or(0);
+        let entries = history["entries"].as_array().ok_or("No entries")?;
+        if (current as usize) < entries.len() - 1 {
+            let entry_id = entries[(current + 1) as usize]["id"].as_i64().ok_or("No id")?;
+            self.send("Page.navigateToHistoryEntry", json!({"entryId": entry_id})).await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        Ok(())
+    }
+
+    // Reload page
+    pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send("Page.reload", json!({})).await?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        Ok(())
+    }
+
     pub async fn get_browser_state(&self) -> Result<BrowserState, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.get_url().await?;
         let title = self.send("Runtime.evaluate", json!({"expression": "document.title"})).await?["result"]["value"].as_str().unwrap_or("").to_string();
@@ -209,14 +373,68 @@ impl ChromeConnection {
         match action {
             "click" => {
                 if let Some(s) = target.as_str() {
-                    if s.starts_with("ax:") { self.click_ax(&s[3..]).await? } 
+                    if s.starts_with("ax:") { self.click_ax(&s[3..]).await? }
+                    else if s.starts_with("xpath:") { self.click_xpath(&s[6..]).await? }
                     else { self.click_element(s).await? }
+                }
+            }
+            "double_click" => {
+                if let Some(s) = target.as_str() {
+                    let id = self.find_element(s).await?;
+                    let b = self.get_bounds(id).await?;
+                    self.double_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                }
+            }
+            "right_click" => {
+                if let Some(s) = target.as_str() {
+                    let id = self.find_element(s).await?;
+                    let b = self.get_bounds(id).await?;
+                    self.right_click_at(b.x + b.width / 2.0, b.y + b.height / 2.0).await?;
+                }
+            }
+            "hover" => {
+                if let Some(s) = target.as_str() {
+                    self.hover_element(s).await?;
                 }
             }
             "type" => {
                 let text = params.and_then(|p| p["text"].as_str()).ok_or("No text")?;
-                if let Some(s) = target.as_str() { self.type_into(s, text).await? } 
-                else { self.type_text(text).await? }
+                if let Some(s) = target.as_str() {
+                    if s.is_empty() {
+                        // No target - type to currently focused element
+                        self.type_text(text).await?;
+                    } else if s.starts_with("ax:") {
+                        // Click accessibility node first to focus, then type
+                        self.click_ax(&s[3..]).await?;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        self.type_text(text).await?;
+                    } else if s.starts_with("xpath:") {
+                        // Click XPath element first to focus, then type
+                        self.click_xpath(&s[6..]).await?;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        self.type_text(text).await?;
+                    } else {
+                        // CSS selector
+                        self.type_into(s, text).await?;
+                    }
+                } else {
+                    self.type_text(text).await?;
+                }
+            }
+            "clear" => {
+                if let Some(s) = target.as_str() {
+                    if s.starts_with("ax:") {
+                        self.click_ax(&s[3..]).await?;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        // Select all and delete
+                        self.send("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "a", "modifiers": 2})).await?;
+                        self.send("Input.dispatchKeyEvent", json!({"type": "keyUp", "key": "a", "modifiers": 2})).await?;
+                        self.send("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "Backspace"})).await?;
+                        self.send("Input.dispatchKeyEvent", json!({"type": "keyUp", "key": "Backspace"})).await?;
+                    } else {
+                        self.clear_input(s).await?;
+                    }
+                }
             }
             "navigate" => {
                 let url = params.and_then(|p| p["url"].as_str()).ok_or("No URL")?;
@@ -231,7 +449,35 @@ impl ChromeConnection {
                 let key = params.and_then(|p| p["key"].as_str()).ok_or("No key")?;
                 self.press_key(key).await?;
             }
-            _ => return Err(format!("Unknown: {}", action).into()),
+            "focus_window" => {
+                self.focus_window().await?;
+            }
+            "select" => {
+                let value = params.and_then(|p| p["value"].as_str()).ok_or("No value")?;
+                if let Some(s) = target.as_str() {
+                    self.select_option(s, value).await?;
+                }
+            }
+            "wait" => {
+                let timeout = params.and_then(|p| p["timeout"].as_u64()).unwrap_or(5000);
+                if let Some(s) = target.as_str() {
+                    self.wait_for_element(s, timeout).await?;
+                }
+            }
+            "go_back" => {
+                self.go_back().await?;
+            }
+            "go_forward" => {
+                self.go_forward().await?;
+            }
+            "reload" => {
+                self.reload().await?;
+            }
+            "eval_js" => {
+                let js = params.and_then(|p| p["code"].as_str()).ok_or("No code")?;
+                self.eval_js(js).await?;
+            }
+            _ => return Err(format!("Unknown action: {}", action).into()),
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         Ok(())

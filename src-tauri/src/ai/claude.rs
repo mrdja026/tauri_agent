@@ -23,8 +23,26 @@ pub async fn get_retry_action(api_key: &str, failed: &ActionCommand, error: &str
 }
 
 fn system_prompt() -> String {
-    r#"You are a PC automation assistant. RULES: 1) ONE action at a time 2) Use element IDs from accessibility tree 3) For browsers use CSS selectors or ax: prefix 4) For desktop use uia_ prefix 5) Learn from failures
-ACTIONS: click, type (params.text), navigate (params.url), scroll (params.direction/amount), press_key (params.key), focus_window
+    r#"You are a browser automation assistant. ONE action at a time. Use CSS selectors for target (or "ax:nodeId" for accessibility tree nodes, or "xpath://..." for XPath).
+
+ACTIONS:
+- click: target=CSS selector|"ax:id"|"xpath:..."
+- double_click: target=CSS selector
+- right_click: target=CSS selector
+- hover: target=CSS selector
+- type: target=CSS selector (or empty for focused), params.text=string
+- clear: target=CSS selector (clears input field)
+- navigate: params.url=URL
+- scroll: params.direction="up"|"down", params.amount=pixels (default 300)
+- press_key: params.key=key name (Enter, Tab, Escape, ArrowDown, etc.)
+- focus_window: brings browser tab to front
+- select: target=CSS selector, params.value=option value (for <select>)
+- wait: target=CSS selector, params.timeout=ms (wait for element to appear)
+- go_back: navigate back in history
+- go_forward: navigate forward in history
+- reload: refresh the page
+- eval_js: params.code=JavaScript to execute
+
 OUTPUT JSON ONLY: {"action_type":"...","target":"...","params":{...},"reasoning":"..."}"#.to_string()
 }
 
