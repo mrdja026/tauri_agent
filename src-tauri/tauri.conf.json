@@ -1,0 +1,38 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "PC Automation Agent",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": { "open": true },
+      "window": { "all": true },
+      "fs": { "all": true, "scope": ["$CONFIG/*", "$TEMP/*"] },
+      "path": { "all": true }
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "com.automation.agent",
+      "targets": "all",
+      "icon": []
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [{
+      "fullscreen": false,
+      "height": 800,
+      "width": 1200,
+      "resizable": true,
+      "title": "PC Automation Agent",
+      "center": true
+    }]
+  }
+}
