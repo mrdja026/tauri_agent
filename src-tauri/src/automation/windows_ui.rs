@@ -7,7 +7,7 @@ use std::mem::zeroed;
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 use windows::{
-    core::BSTR,
+    core::{BSTR, PCWSTR},
     Win32::{
         Foundation::HWND,
         System::{
@@ -33,6 +33,7 @@ use windows::{
             },
             WindowsAndMessaging::{
                 GetForegroundWindow, GetWindowTextW, SetForegroundWindow, SetCursorPos,
+                FindWindowW,
             },
         },
     },
@@ -125,14 +126,30 @@ impl WindowsAutomation {
         }
     }
 
-    /// Build accessibility tree from desktop root (includes taskbar, tray, focused window)
+    /// Build accessibility tree from focused window + taskbar only (fast scan)
     pub fn get_a11y_tree(&self) -> Result<Vec<AXNode>, BoxError> {
         unsafe {
-            let root = self.automation.GetRootElement()?;
             let walker = self.automation.RawViewWalker()?;
-
             let mut nodes = Vec::new();
-            self.walk_tree(&root, &walker, &mut nodes)?;
+
+            // 1. Get focused window tree
+            let focused_hwnd = self.get_focused_hwnd();
+            if focused_hwnd.0 != 0 {
+                if let Ok(focused_element) = self.automation.ElementFromHandle(focused_hwnd) {
+                    self.walk_tree(&focused_element, &walker, &mut nodes)?;
+                }
+            }
+
+            // 2. Get taskbar tree (for pinned apps, start button, tray)
+            // Taskbar class name is "Shell_TrayWnd"
+            let taskbar_class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+            let taskbar_hwnd = FindWindowW(PCWSTR(taskbar_class.as_ptr()), PCWSTR::null());
+            if taskbar_hwnd.0 != 0 {
+                if let Ok(taskbar_element) = self.automation.ElementFromHandle(taskbar_hwnd) {
+                    self.walk_tree(&taskbar_element, &walker, &mut nodes)?;
+                }
+            }
+
             Ok(nodes)
         }
     }
@@ -522,30 +539,45 @@ impl WindowsAutomation {
 
     // ==================== Application Launch ====================
 
-    /// Try to launch a browser (Chrome, Edge, Firefox) - returns on first success
+    /// Try to launch a browser (Chrome, Edge, Firefox) with remote debugging enabled
+    /// This allows CDP (Chrome DevTools Protocol) to connect for better automation
     pub fn launch_browser(&self, url: Option<&str>) -> Result<String, BoxError> {
+        const DEBUG_PORT: u16 = 9222;
+
         let browsers = [
-            // Chrome paths
-            (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "Chrome"),
-            (r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "Chrome"),
-            // Edge paths
-            (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "Edge"),
-            (r"C:\Program Files\Microsoft\Edge\Application\msedge.exe", "Edge"),
-            // Firefox paths
-            (r"C:\Program Files\Mozilla Firefox\firefox.exe", "Firefox"),
-            (r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe", "Firefox"),
+            // Chrome paths - supports --remote-debugging-port
+            (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "Chrome", true),
+            (r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "Chrome", true),
+            // Edge paths - supports --remote-debugging-port (Chromium-based)
+            (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "Edge", true),
+            (r"C:\Program Files\Microsoft\Edge\Application\msedge.exe", "Edge", true),
+            // Firefox paths - uses different debugging protocol, no CDP flag
+            (r"C:\Program Files\Mozilla Firefox\firefox.exe", "Firefox", false),
+            (r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe", "Firefox", false),
         ];
 
-        for (path, name) in browsers {
+        for (path, name, supports_cdp) in browsers {
             if std::path::Path::new(path).exists() {
                 let mut cmd = std::process::Command::new(path);
+
+                // Add remote debugging flag for Chromium-based browsers
+                if supports_cdp {
+                    cmd.arg(format!("--remote-debugging-port={}", DEBUG_PORT));
+                }
+
                 if let Some(u) = url {
                     cmd.arg(u);
                 }
+
                 match cmd.spawn() {
                     Ok(_) => {
                         std::thread::sleep(std::time::Duration::from_secs(2));
-                        return Ok(format!("Launched {} from {}", name, path));
+                        let debug_info = if supports_cdp {
+                            format!(" (CDP enabled on port {})", DEBUG_PORT)
+                        } else {
+                            String::new()
+                        };
+                        return Ok(format!("Launched {}{}", name, debug_info));
                     }
                     Err(_) => continue,
                 }
@@ -556,32 +588,35 @@ impl WindowsAutomation {
     }
 
     /// Launch a specific application by name or path
+    /// Browsers (Chrome, Edge) are launched with remote debugging enabled for CDP
     pub fn launch_app(&self, app: &str, args: Option<&[&str]>) -> Result<(), BoxError> {
-        // Common app name mappings to paths
-        let app_path = match app.to_lowercase().as_str() {
-            "chrome" | "google chrome" => self.find_app(&[
+        const DEBUG_PORT: u16 = 9222;
+
+        // Check if this is a browser that supports CDP
+        let (app_path, is_chromium_browser) = match app.to_lowercase().as_str() {
+            "chrome" | "google chrome" => (self.find_app(&[
                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            ]),
-            "edge" | "msedge" | "microsoft edge" => self.find_app(&[
+            ]), true),
+            "edge" | "msedge" | "microsoft edge" => (self.find_app(&[
                 r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                 r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            ]),
-            "firefox" | "mozilla firefox" => self.find_app(&[
+            ]), true),
+            "firefox" | "mozilla firefox" => (self.find_app(&[
                 r"C:\Program Files\Mozilla Firefox\firefox.exe",
                 r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
-            ]),
-            "notepad" => Some(r"C:\Windows\System32\notepad.exe".to_string()),
-            "explorer" | "file explorer" => Some(r"C:\Windows\explorer.exe".to_string()),
-            "cmd" | "command prompt" => Some(r"C:\Windows\System32\cmd.exe".to_string()),
-            "powershell" => Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string()),
-            "calc" | "calculator" => Some(r"C:\Windows\System32\calc.exe".to_string()),
+            ]), false),
+            "notepad" => (Some(r"C:\Windows\System32\notepad.exe".to_string()), false),
+            "explorer" | "file explorer" => (Some(r"C:\Windows\explorer.exe".to_string()), false),
+            "cmd" | "command prompt" => (Some(r"C:\Windows\System32\cmd.exe".to_string()), false),
+            "powershell" => (Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string()), false),
+            "calc" | "calculator" => (Some(r"C:\Windows\System32\calc.exe".to_string()), false),
             // If not a known name, treat as path
             _ => {
                 if std::path::Path::new(app).exists() {
-                    Some(app.to_string())
+                    (Some(app.to_string()), false)
                 } else {
-                    None
+                    (None, false)
                 }
             }
         };
@@ -589,6 +624,12 @@ impl WindowsAutomation {
         let path = app_path.ok_or(format!("Application not found: {}", app))?;
 
         let mut cmd = std::process::Command::new(&path);
+
+        // Add remote debugging for Chromium browsers
+        if is_chromium_browser {
+            cmd.arg(format!("--remote-debugging-port={}", DEBUG_PORT));
+        }
+
         if let Some(a) = args {
             cmd.args(a);
         }
@@ -652,10 +693,12 @@ impl WindowsAutomation {
 
     // ==================== Combined State ====================
 
-    /// Get full desktop state (window info + screenshot + accessibility tree)
+    /// Get full desktop state (window info + accessibility tree)
+    /// Screenshot disabled for performance - enable via get_desktop_state_with_screenshot()
     pub fn get_desktop_state(&self) -> Result<DesktopState, BoxError> {
         let window_title = self.get_window_title()?;
-        let screenshot_base64 = self.screenshot()?;
+        // Screenshot disabled for performance
+        let screenshot_base64 = String::new();
         let accessibility_tree = self.get_a11y_tree()?;
 
         Ok(DesktopState {
@@ -862,6 +905,11 @@ impl WindowsAutomation {
                     .or_else(|| target.as_str())
                     .ok_or("No command specified. Use params.command or target.")?;
                 self.run_command(cmd)?;
+            }
+            // Goal completion action - no-op, just signals done
+            "complete" => {
+                // This is a signal action - nothing to execute
+                // The main loop handles this specially
             }
             // Browser-only actions - return clear error in desktop mode
             "navigate" => {
